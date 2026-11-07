@@ -1,0 +1,112 @@
+name: Release
+
+# Every merge to a repository's deploy branch gets a version tag and a GitHub release, made
+# here and never by hand. Each repository calls this file from a short workflow of its own:
+#
+#   name: Release
+#   on:
+#     push:
+#       branches: [main]        # the branch a merge deploys from: master where there is a release PR
+#     workflow_dispatch:        # re-run after a failed run; a commit that already has a tag is skipped
+#   permissions:
+#     contents: write
+#   jobs:
+#     release:
+#       uses: praycom/.github/.github/workflows/release.yml@main
+#
+# It lives in this repository because this one is public: any repository in the organization,
+# public or private, can call a workflow here without an access setting.
+#
+# How the version is picked, from the commits since the last release that the merged commit
+# contains (merge commits are skipped, the commits they bring in are not):
+#
+#   a subject `type!:` or a `BREAKING CHANGE:` footer   ->  major   v1.4.2 -> v2.0.0
+#   any subject starting `feat`                          ->  minor   v1.4.2 -> v1.5.0
+#   anything else                                        ->  patch   v1.4.2 -> v1.4.3
+#
+# Every merge is released, `chore` and `docs` included: in a repository of IAM or alarm code a
+# chore can change who may do what, and "nothing shipped" is not something a script can judge.
+# The first release of a repository with no `vX.Y.Z` tag is v1.0.0. The notes are GitHub's
+# generated notes: the pull requests merged since the previous release, with their authors.
+#
+# Two merges close together: runs queue one at a time, and GitHub keeps only the newest
+# waiting run, so a merge whose run was dropped is released by the next one, together with it.
+# No commit is left out; it shares a version.
+
+on:
+  workflow_call:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: release
+    # GitHub-hosted: this job holds a token that can write tags, and a fresh machine per run
+    # means no earlier job can have left anything behind for it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # Every commit and tag: the version is counted from the last tag, and a shallow
+          # clone has none, which would quietly start again at v1.0.0.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          semver='^v[0-9]+\.[0-9]+\.[0-9]+$'
+
+          done_tag=$(git tag --points-at "$SHA" | grep -E "$semver" | head -1 || true)
+          if [ -n "$done_tag" ]; then
+            echo "Already released as $done_tag." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # The number continues from the highest tag in the repository; the commits counted
+          # are the ones since the highest tag this commit contains. Both are the same tag
+          # unless someone tagged a commit that never reached this branch.
+          highest=$(git tag --list 'v*' --sort=-v:refname | grep -E "$semver" | head -1 || true)
+          previous=$(git tag --merged "$SHA" --list 'v*' --sort=-v:refname | grep -E "$semver" | head -1 || true)
+          range=${previous:+$previous..}$SHA
+
+          # Here-strings, not pipes: `grep -q` stops reading at the first match, the writer then
+          # dies of SIGPIPE, and under pipefail a match would read as "no match".
+          subjects=$(git log --no-merges --format=%s "$range")
+          messages=$(git log --no-merges --format=%B "$range")
+          if grep -qE '^BREAKING[ -]CHANGE:' <<< "$messages" || grep -qE '^[a-z]+(\([^)]*\))?!:' <<< "$subjects"; then
+            bump='major'
+          elif grep -qE '^feat(\([^)]*\))?:' <<< "$subjects"; then
+            bump='minor'
+          else
+            bump='patch'
+          fi
+
+          if [ -z "$highest" ]; then
+            next=v1.0.0
+          else
+            IFS=. read -r major minor patch <<< "${highest#v}"
+            case $bump in
+              major) next="v$((major + 1)).0.0" ;;
+              minor) next="v$major.$((minor + 1)).0" ;;
+              patch) next="v$major.$minor.$((patch + 1))" ;;
+            esac
+          fi
+
+          args=(--repo "$REPO" --target "$SHA" --title "$next" --generate-notes)
+          if [ -n "$previous" ]; then
+            args+=(--notes-start-tag "$previous")
+          fi
+          gh release create "$next" "${args[@]}"
+          echo "Released $next ($bump, since ${previous:-the first commit})." >> "$GITHUB_STEP_SUMMARY"
